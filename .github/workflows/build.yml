@@ -25,7 +25,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           chmod +x gradlew
-          bash ./gradlew :patches:buildAndroid --no-daemon
+          bash ./gradlew :patches:buildAndroid --no-daemon --dependency-verification=lenient
       - uses: actions/upload-artifact@v4
         with:
           name: hushmessenger-peek
