@@ -13,7 +13,9 @@ import android.view.Window;
 import android.widget.FrameLayout;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
+import android.util.Log;
 import android.widget.TextView;
+import android.widget.Toast;
 import java.lang.ref.WeakReference;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
@@ -31,6 +33,7 @@ public final class ChatPeek {
     private static final String SNIPPET =
         "com.facebook.messaging.threadlist.plugins.core.threadsnippet.lastmessage.LastMessageSnippetImpl";
     private static final long FRESH_MS = 3_000L;
+    private static final boolean DEBUG = true;
 
     private static WeakReference<View> row;
     private static CharSequence snippet;
@@ -50,9 +53,26 @@ public final class ChatPeek {
             rowTop = at[1];
             row = new WeakReference<>(view);
             stamp = System.currentTimeMillis();
-            snippet = readSnippet(view.getContext(), findSession(holder), summary);
-        } catch (Throwable ignored) {
+            try {
+                snippet = readSnippet(view.getContext(), findSession(holder), summary);
+            } catch (Throwable t) {
+                snippet = null;
+                debug(view.getContext(), "peek: no text (" + t.getClass().getSimpleName() + ")", t);
+            }
+            debug(view.getContext(), "peek: launch ok, text=" + (snippet != null), null);
+        } catch (Throwable t) {
             row = null;
+            if (view != null) debug(view.getContext(), "peek: launch failed " + t.getClass().getSimpleName(), t);
+        }
+    }
+
+    private static void debug(Context context, String message, Throwable t) {
+        if (!DEBUG) return;
+        try {
+            Log.w("ChatPeek", message, t);
+            Toast.makeText(context, message, Toast.LENGTH_SHORT).show();
+        } catch (Throwable ignored) {
+            // Debug output only.
         }
     }
 
@@ -60,10 +80,17 @@ public final class ChatPeek {
     public static void menuStarted(Object fragment) {
         try {
             View pressed = row == null ? null : row.get();
-            if (pressed == null || System.currentTimeMillis() - stamp > FRESH_MS) return;
+            if (pressed == null || System.currentTimeMillis() - stamp > FRESH_MS) {
+                Log.w("ChatPeek", "menu started but no fresh row");
+                return;
+            }
             row = null;
             Dialog dialog = findDialog(fragment);
-            if (dialog == null || dialog.getWindow() == null) return;
+            if (dialog == null || dialog.getWindow() == null) {
+                debug(pressed.getContext(), "peek: no dialog window", null);
+                return;
+            }
+            debug(pressed.getContext(), "peek: menu found", null);
             final Window window = dialog.getWindow();
             final Bitmap picture = capture(pressed);
             final CharSequence text = snippet;
@@ -72,13 +99,13 @@ public final class ChatPeek {
                 @Override public void run() {
                     try {
                         addCard(window, picture, text, top);
-                    } catch (Throwable ignored) {
-                        // The stock menu stays as it was.
+                    } catch (Throwable t) {
+                        debug(window.getDecorView().getContext(), "peek: card failed " + t.getClass().getSimpleName(), t);
                     }
                 }
             });
-        } catch (Throwable ignored) {
-            // The stock menu stays as it was.
+        } catch (Throwable t) {
+            Log.w("ChatPeek", "menuStarted failed", t);
         }
     }
 
@@ -208,4 +235,4 @@ public final class ChatPeek {
         window.addContentView(card, params);
         card.animate().alpha(1f).setDuration(140).start();
     }
-}
+    }
