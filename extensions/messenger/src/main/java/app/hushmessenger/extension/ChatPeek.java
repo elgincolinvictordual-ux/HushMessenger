@@ -3,30 +3,29 @@ package app.hushmessenger.extension;
 import android.app.Dialog;
 import android.content.Context;
 import android.content.res.Configuration;
-import android.graphics.Bitmap;
-import android.graphics.Canvas;
 import android.graphics.drawable.GradientDrawable;
+import android.os.Handler;
+import android.os.Looper;
+import android.text.TextUtils;
+import android.util.Log;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.Window;
 import android.widget.FrameLayout;
-import android.widget.ImageView;
 import android.widget.LinearLayout;
-import android.util.Log;
 import android.widget.TextView;
 import android.widget.Toast;
-import java.lang.ref.WeakReference;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 
 /**
- * iPhone-style peek for the chat list. A long press on a chat row calls {@link #launch} just before Messenger opens its
- * menu. When the menu's fragment starts, {@link #menuStarted} puts a card in the menu's window: a picture of the pressed
- * row, plus the chat's last message in full. Everything is found by type and shape, never by Messenger's renamed
- * members, and any failure leaves the stock menu alone.
+ * iPhone-style peek for the chat list. A long press on a chat calls {@link #launch} just before Messenger builds its
+ * bottom sheet menu. When the sheet is shown, {@link #sheetShown} puts a card with the chat's last message in the free
+ * space above it. Everything is found by type and shape, never by Messenger's renamed members, and any failure leaves
+ * the stock menu alone.
  */
 public final class ChatPeek {
     private static final String SESSION = "com.facebook.auth.usersession.FbUserSession";
@@ -35,85 +34,94 @@ public final class ChatPeek {
     private static final long FRESH_MS = 3_000L;
     private static final boolean DEBUG = true;
 
-    private static WeakReference<View> row;
+    private static boolean pending;
     private static CharSequence snippet;
-    private static int rowTop;
+    private static Context appContext;
     private static long stamp;
 
     private ChatPeek() {}
 
     /** Called first thing in the method that opens a chat's long press menu. The arguments are Messenger's, in order. */
     public static void launch(View view, Object a1, Object a2, Object summary, Object a4, Object holder, Object a6, Object a7) {
+        Context context = null;
         try {
-            row = null;
+            pending = false;
             snippet = null;
-            if (view == null || summary == null) return;
-            int[] at = new int[2];
-            view.getLocationOnScreen(at);
-            rowTop = at[1];
-            row = new WeakReference<>(view);
+            if (summary == null) return;
+            context = view != null ? view.getContext() : (Context) findByType(holder, Context.class.getName());
+            if (context == null) return;
+            appContext = context;
             stamp = System.currentTimeMillis();
+            pending = true;
             try {
-                snippet = readSnippet(view.getContext(), findSession(holder), summary);
+                snippet = readSnippet(context, findByType(holder, SESSION), summary);
             } catch (Throwable t) {
                 snippet = null;
-                debug(view.getContext(), "peek: no text (" + t.getClass().getSimpleName() + ")", t);
+                debug("peek: no text (" + t.getClass().getSimpleName() + ")", t);
             }
-            debug(view.getContext(), "peek: launch ok, text=" + (snippet != null), null);
+            debug("peek: launch ok, text=" + (snippet != null), null);
         } catch (Throwable t) {
-            row = null;
-            if (view != null) debug(view.getContext(), "peek: launch failed " + t.getClass().getSimpleName(), t);
+            pending = false;
+            debug("peek: launch failed " + t.getClass().getSimpleName(), t);
         }
     }
 
-    private static void debug(Context context, String message, Throwable t) {
+    /** Called at the start of the bottom sheet builder's show method, with the builder. */
+    public static void sheetShown(final Object sheet) {
+        try {
+            if (!pending || System.currentTimeMillis() - stamp > FRESH_MS) return;
+            pending = false;
+            final CharSequence text = snippet;
+            final Handler handler = new Handler(Looper.getMainLooper());
+            handler.post(new Runnable() {
+                int tries = 0;
+                @Override public void run() {
+                    try {
+                        Object fragment = lazyValue(sheet);
+                        Dialog dialog = fragment == null ? null : findDialog(fragment);
+                        Window window = dialog == null ? null : dialog.getWindow();
+                        if (window != null && window.getDecorView().isAttachedToWindow() && window.getDecorView().getHeight() > 0) {
+                            debug("peek: sheet found", null);
+                            final Window w = window;
+                            handler.postDelayed(new Runnable() {
+                                @Override public void run() {
+                                    try {
+                                        addCard(w, text);
+                                    } catch (Throwable t) {
+                                        debug("peek: card failed " + t.getClass().getSimpleName(), t);
+                                    }
+                                }
+                            }, 400);
+                        } else if (++tries < 30) {
+                            handler.postDelayed(this, 60);
+                        } else {
+                            debug("peek: sheet window not found", null);
+                        }
+                    } catch (Throwable t) {
+                        debug("peek: waiting failed " + t.getClass().getSimpleName(), t);
+                    }
+                }
+            });
+        } catch (Throwable t) {
+            debug("peek: sheetShown failed " + t.getClass().getSimpleName(), t);
+        }
+    }
+
+    private static void debug(String message, Throwable t) {
         if (!DEBUG) return;
         try {
             Log.w("ChatPeek", message, t);
-            Toast.makeText(context, message, Toast.LENGTH_SHORT).show();
+            if (appContext != null) Toast.makeText(appContext, message, Toast.LENGTH_SHORT).show();
         } catch (Throwable ignored) {
             // Debug output only.
         }
     }
 
-    /** Called at the start of the menu fragment's onStart with the fragment. */
-    public static void menuStarted(Object fragment) {
-        try {
-            View pressed = row == null ? null : row.get();
-            if (pressed == null || System.currentTimeMillis() - stamp > FRESH_MS) {
-                Log.w("ChatPeek", "menu started but no fresh row");
-                return;
-            }
-            row = null;
-            Dialog dialog = findDialog(fragment);
-            if (dialog == null || dialog.getWindow() == null) {
-                debug(pressed.getContext(), "peek: no dialog window", null);
-                return;
-            }
-            debug(pressed.getContext(), "peek: menu found", null);
-            final Window window = dialog.getWindow();
-            final Bitmap picture = capture(pressed);
-            final CharSequence text = snippet;
-            final int top = rowTop;
-            window.getDecorView().post(new Runnable() {
-                @Override public void run() {
-                    try {
-                        addCard(window, picture, text, top);
-                    } catch (Throwable t) {
-                        debug(window.getDecorView().getContext(), "peek: card failed " + t.getClass().getSimpleName(), t);
-                    }
-                }
-            });
-        } catch (Throwable t) {
-            Log.w("ChatPeek", "menuStarted failed", t);
-        }
-    }
-
-    private static Object findSession(Object holder) throws Exception {
+    private static Object findByType(Object holder, String typeName) throws Exception {
         if (holder == null) return null;
         for (Class<?> c = holder.getClass(); c != null && c != Object.class; c = c.getSuperclass()) {
             for (Field f : c.getDeclaredFields()) {
-                if (Modifier.isStatic(f.getModifiers()) || !SESSION.equals(f.getType().getName())) continue;
+                if (Modifier.isStatic(f.getModifiers()) || !typeName.equals(f.getType().getName())) continue;
                 f.setAccessible(true);
                 Object value = f.get(holder);
                 if (value != null) return value;
@@ -122,7 +130,26 @@ public final class ChatPeek {
         return null;
     }
 
-    /** The row's own last-message text, built by Messenger's snippet maker so it matches what the row shows. */
+    /** The sheet builder keeps its fragment in a lazy holder; this finds that holder by its getValue method. */
+    private static Object lazyValue(Object sheet) throws Exception {
+        for (Field f : sheet.getClass().getDeclaredFields()) {
+            if (Modifier.isStatic(f.getModifiers())) continue;
+            f.setAccessible(true);
+            Object holder = f.get(sheet);
+            if (holder == null) continue;
+            try {
+                Method get = holder.getClass().getMethod("getValue");
+                get.setAccessible(true);
+                Object value = get.invoke(holder);
+                if (value != null && findDialogMethod(value.getClass()) != null) return value;
+            } catch (NoSuchMethodException ignored) {
+                // Not the lazy holder.
+            }
+        }
+        return null;
+    }
+
+    /** The thread's last-message text, built by Messenger's snippet maker so it matches what the chat row shows. */
     private static CharSequence readSnippet(Context context, Object session, Object summary) throws Exception {
         if (session == null) return null;
         Class<?> type = Class.forName(SNIPPET, false, context.getClassLoader());
@@ -158,7 +185,16 @@ public final class ChatPeek {
         return null;
     }
 
-    private static Dialog findDialog(Object fragment) throws Exception {
+    private static Method findDialogMethod(Class<?> type) {
+        for (Class<?> c = type; c != null && c != Object.class; c = c.getSuperclass()) {
+            for (Method m : c.getDeclaredMethods()) {
+                if (m.getParameterTypes().length == 0 && m.getReturnType() == Dialog.class && !Modifier.isStatic(m.getModifiers())) return m;
+            }
+        }
+        return null;
+    }
+
+    private static Dialog findDialog(Object fragment) {
         for (Class<?> c = fragment.getClass(); c != null && c != Object.class; c = c.getSuperclass()) {
             for (Method m : c.getDeclaredMethods()) {
                 if (m.getParameterTypes().length != 0 || m.getReturnType() != Dialog.class || Modifier.isStatic(m.getModifiers())) continue;
@@ -174,26 +210,49 @@ public final class ChatPeek {
         return null;
     }
 
-    private static Bitmap capture(View view) {
-        try {
-            if (view.getWidth() <= 0 || view.getHeight() <= 0) return null;
-            Bitmap bitmap = Bitmap.createBitmap(view.getWidth(), view.getHeight(), Bitmap.Config.ARGB_8888);
-            view.draw(new Canvas(bitmap));
-            return bitmap;
-        } catch (Throwable ignored) {
-            return null;
+    /** Top edge of the bottom sheet: the highest wide view that reaches the bottom of the window. */
+    private static int sheetTop(View decor) {
+        int height = decor.getHeight();
+        int[] best = { (int) (height * 0.40f) };
+        scan(decor, decor, best);
+        return best[0];
+    }
+
+    private static void scan(View root, View view, int[] best) {
+        int height = root.getHeight();
+        int[] a = new int[2];
+        int[] b = new int[2];
+        root.getLocationInWindow(a);
+        view.getLocationInWindow(b);
+        int top = b[1] - a[1];
+        if (view != root && view.getVisibility() == View.VISIBLE && view.getWidth() >= root.getWidth() * 0.9f
+            && view.getHeight() > height * 0.2f && top > height * 0.1f && top + view.getHeight() >= height * 0.95f
+            && top < best[0]) {
+            best[0] = top;
+        }
+        if (view instanceof ViewGroup) {
+            ViewGroup group = (ViewGroup) view;
+            for (int i = 0; i < group.getChildCount(); i++) scan(root, group.getChildAt(i), best);
         }
     }
 
-    private static void addCard(Window window, Bitmap picture, CharSequence text, int rowTop) {
+    private static void addCard(Window window, CharSequence text) {
+        if (text == null || text.length() == 0) {
+            debug("peek: no text to show", null);
+            return;
+        }
         View decor = window.getDecorView();
         Context context = decor.getContext();
         float density = context.getResources().getDisplayMetrics().density;
         boolean night = (context.getResources().getConfiguration().uiMode & Configuration.UI_MODE_NIGHT_MASK)
             == Configuration.UI_MODE_NIGHT_YES;
-        int pad = (int) (12 * density);
+        int pad = (int) (14 * density);
         int margin = (int) (12 * density);
-        int safeTop = (int) (32 * density);
+        int safeTop = (int) (36 * density);
+
+        int sheetTop = sheetTop(decor);
+        int allowed = sheetTop - margin - safeTop;
+        int lines = Math.max(2, Math.min(8, (int) ((allowed - 2 * pad - 20 * density) / (22 * density))));
 
         LinearLayout card = new LinearLayout(context);
         card.setOrientation(LinearLayout.VERTICAL);
@@ -204,35 +263,31 @@ public final class ChatPeek {
         card.setBackground(background);
         card.setElevation(16 * density);
 
-        if (picture != null) {
-            ImageView image = new ImageView(context);
-            image.setImageBitmap(picture);
-            image.setAdjustViewBounds(true);
-            image.setScaleType(ImageView.ScaleType.FIT_CENTER);
-            card.addView(image, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-        }
-        if (text != null && text.length() > 0) {
-            TextView body = new TextView(context);
-            body.setText(text);
-            body.setTextSize(15);
-            body.setMaxLines(10);
-            body.setEllipsize(android.text.TextUtils.TruncateAt.END);
-            body.setTextColor(night ? 0xFFE4E6EB : 0xFF1C1E21);
-            body.setPadding(0, picture != null ? pad / 2 : 0, 0, 0);
-            card.addView(body);
-        }
-        if (card.getChildCount() == 0) return;
+        TextView label = new TextView(context);
+        label.setText("Last message");
+        label.setTextSize(12);
+        label.setTextColor(night ? 0xFFB0B3B8 : 0xFF65676B);
+        card.addView(label);
+
+        TextView body = new TextView(context);
+        body.setText(text);
+        body.setTextSize(16);
+        body.setMaxLines(lines);
+        body.setEllipsize(TextUtils.TruncateAt.END);
+        body.setTextColor(night ? 0xFFE4E6EB : 0xFF1C1E21);
+        body.setPadding(0, (int) (4 * density), 0, 0);
+        card.addView(body);
 
         int width = decor.getWidth() - 2 * margin;
         card.measure(View.MeasureSpec.makeMeasureSpec(width, View.MeasureSpec.EXACTLY),
             View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED));
-        // Above the pressed row when there is room, else at the top of the screen.
-        int top = Math.max(safeTop, rowTop - card.getMeasuredHeight() - margin);
+        int top = Math.max(safeTop, sheetTop - card.getMeasuredHeight() - margin);
         FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(width, ViewGroup.LayoutParams.WRAP_CONTENT,
             Gravity.TOP | Gravity.CENTER_HORIZONTAL);
         params.topMargin = top;
         card.setAlpha(0f);
         window.addContentView(card, params);
-        card.animate().alpha(1f).setDuration(140).start();
+        card.animate().alpha(1f).setDuration(160).start();
+        debug("peek: card shown", null);
     }
     }
