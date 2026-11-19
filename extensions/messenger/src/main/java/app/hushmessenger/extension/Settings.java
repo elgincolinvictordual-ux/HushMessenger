@@ -73,6 +73,8 @@ public final class Settings {
             if (installed.contains(MessageLog.KEY)) MessageLog.scheduleExpiry();
             // Only when the installed list was read for sure, so a failed read can't cost a log the control still has.
             else if (listed && !preview) MessageLog.dropLeftovers(appContext);
+            // Loads Messenger's chat preview in the background so the first long press isn't slow.
+            ChatPreviewWarmup.schedule();
         }
     }
 
