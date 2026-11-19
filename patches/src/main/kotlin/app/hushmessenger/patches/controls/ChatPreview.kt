@@ -106,12 +106,55 @@ internal fun MutableMethod.validateChatPreview() {
 }
 
 /**
+ * Meta's server setting for how long the preview may wait for the chat inside it to draw before it shows anyway,
+ * in milliseconds. Messenger keeps it between 300 and 5000 and starts counting when the finger touches the chat.
+ */
+internal const val CHAT_PREVIEW_TIMEOUT_FLAG = 0x102053600030ab5L
+
+internal const val CHAT_PREVIEW_TIMEOUT_HELPER = "$SETTINGS->chatPreviewTimeout(J)J"
+
+/** One read of the wait setting: the move-result-wide that takes the value and the first register of its pair. */
+internal class ChatPreviewTimeoutSite(val result: Int, val register: Int)
+
+/**
+ * Each read loads the setting into a register pair, passes the pair as the last two arguments of a static (…J)J call
+ * and moves the value into a pair. A read that doesn't have exactly that shape is left alone: the preview then waits as
+ * long as Messenger says, which is only slower.
+ */
+internal fun Method.chatPreviewTimeoutSites(): List<ChatPreviewTimeoutSite> {
+    val code = implementation?.instructions?.toList() ?: return emptyList()
+    val targets = jumpTargets()
+    return code.indices.filter { at ->
+        code[at].opcode == Opcode.CONST_WIDE && (code[at] as WideLiteralInstruction).wideLiteral == CHAT_PREVIEW_TIMEOUT_FLAG
+    }.mapNotNull { at ->
+        val pair = (code[at] as OneRegisterInstruction).registerA
+        val invoke = code.getOrNull(at + 1) as? FiveRegisterInstruction ?: return@mapNotNull null
+        val read = (invoke as ReferenceInstruction).reference as? MethodReference ?: return@mapNotNull null
+        val arguments = listOf(invoke.registerC, invoke.registerD, invoke.registerE, invoke.registerF, invoke.registerG).take(invoke.registerCount)
+        val result = code.getOrNull(at + 2)
+        if (invoke.opcode != Opcode.INVOKE_STATIC || read.returnType != "J" || read.parameterTypes.lastOrNull()?.toString() != "J" ||
+            arguments.size < 2 || arguments.takeLast(2) != listOf(pair, pair + 1) || result?.opcode != Opcode.MOVE_RESULT_WIDE ||
+            (at + 1..at + 2).any { it in targets }) return@mapNotNull null
+        ChatPreviewTimeoutSite(at + 2, (result as OneRegisterInstruction).registerA)
+    }
+}
+
+/**
  * Each answer passes through the extension, which can only turn a no into a yes. The rest of the handler still runs
- * as Messenger wrote it, so a chat it can't preview still gets the plain menu. Later reads go first.
+ * as Messenger wrote it, so a chat it can't preview still gets the plain menu. The wait setting passes through it too
+ * and comes back no longer than the shortest wait Messenger allows. Later edits go first, so the places above them hold.
  */
 internal fun MutableMethod.injectChatPreview() {
-    for (site in chatPreviewSites().asReversed()) addInstructions(site.result + 1, """
-        invoke-static/range {v${site.register} .. v${site.register}}, $CHAT_PREVIEW_HELPER
-        move-result v${site.register}
-    """.trimIndent())
+    val edits = chatPreviewSites().map { site ->
+        site.result to """
+            invoke-static/range {v${site.register} .. v${site.register}}, $CHAT_PREVIEW_HELPER
+            move-result v${site.register}
+        """.trimIndent()
+    } + chatPreviewTimeoutSites().map { site ->
+        site.result to """
+            invoke-static/range {v${site.register} .. v${site.register + 1}}, $CHAT_PREVIEW_TIMEOUT_HELPER
+            move-result-wide v${site.register}
+        """.trimIndent()
+    }
+    for ((at, code) in edits.sortedByDescending { it.first }) addInstructions(at + 1, code)
 }
