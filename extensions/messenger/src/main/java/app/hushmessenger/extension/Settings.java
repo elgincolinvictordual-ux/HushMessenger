@@ -73,8 +73,6 @@ public final class Settings {
             if (installed.contains(MessageLog.KEY)) MessageLog.scheduleExpiry();
             // Only when the installed list was read for sure, so a failed read can't cost a log the control still has.
             else if (listed && !preview) MessageLog.dropLeftovers(appContext);
-            // Loads Messenger's chat preview in the background so the first long press isn't slow.
-            ChatPreviewWarmup.schedule();
         }
     }
 
@@ -831,6 +829,8 @@ public final class Settings {
      * keep Meta's answer.
      */
     public static boolean chatPreview(boolean stock) { return enabled("chat_preview") || stock; }
+    /** The longest the preview waits for the chat to draw before it shows, in ms. Messenger never goes below 300. */
+    public static long chatPreviewTimeout(long stock) { return enabled("chat_preview") ? Math.min(stock, 300L) : stock; }
 
     /**
      * Asked with Meta's answer wherever one of the chat list's four typing plugins reads its flag: the inbox loader,
